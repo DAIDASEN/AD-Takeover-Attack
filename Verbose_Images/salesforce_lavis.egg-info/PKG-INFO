@@ -1,0 +1,118 @@
+Metadata-Version: 2.4
+Name: salesforce-lavis
+Version: 1.0.1
+Summary: LAVIS - A One-stop Library for Language-Vision Intelligence
+Author: Dongxu Li, Junnan Li, Hung Le, Guangsen Wang, Silvio Savarese, Steven C.H. Hoi
+License: 3-Clause BSD
+Keywords: Vision-Language,Multimodal,Image Captioning,Generative AI,Deep Learning,Library,PyTorch
+Requires-Python: >=3.7.0
+Description-Content-Type: text/markdown
+Requires-Dist: contexttimer
+Requires-Dist: decord
+Requires-Dist: diffusers<=0.16.0
+Requires-Dist: einops>=0.4.1
+Requires-Dist: fairscale==0.4.4
+Requires-Dist: ftfy
+Requires-Dist: iopath
+Requires-Dist: ipython
+Requires-Dist: omegaconf
+Requires-Dist: opencv-python-headless==4.5.5.64
+Requires-Dist: opendatasets
+Requires-Dist: packaging
+Requires-Dist: pandas
+Requires-Dist: plotly
+Requires-Dist: pre-commit
+Requires-Dist: pycocoevalcap
+Requires-Dist: pycocotools
+Requires-Dist: python-magic
+Requires-Dist: scikit-image
+Requires-Dist: sentencepiece
+Requires-Dist: spacy
+Requires-Dist: streamlit
+Requires-Dist: timm==0.4.12
+Requires-Dist: torch>=1.10.0
+Requires-Dist: torchvision
+Requires-Dist: tqdm
+Requires-Dist: transformers==4.33.2
+Requires-Dist: webdataset
+Requires-Dist: wheel
+Requires-Dist: torchaudio
+Requires-Dist: soundfile
+Requires-Dist: moviepy
+Requires-Dist: nltk
+Requires-Dist: peft
+Requires-Dist: easydict==1.9
+Requires-Dist: pyyaml_env_tag==0.1
+Requires-Dist: open3d==0.13.0
+Requires-Dist: h5py
+Requires-Dist: wandb
+Requires-Dist: pyRAPL
+Requires-Dist: pynvml
+Requires-Dist: bitsandbytes==0.37.0
+Requires-Dist: markupsafe==2.0.1
+Dynamic: author
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: keywords
+Dynamic: license
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# Inducing High Energy-Latency of Large Vision-Language Models with Verbose Images
+
+This repository provides the pytorch implementatin of our ICLR 2024 work: [Inducing High Energy-Latency of Large Vision-Language Models with Verbose Images](https://arxiv.org/abs/2401.11170).
+
+## Abstract
+
+Large vision-language models (VLMs) such as GPT-4 have achieved exceptional performance across various multi-modal tasks. However, the deployment of VLMs necessitates substantial energy consumption and computational resources. Once attackers maliciously induce high energy consumption and latency time (energy-latency cost) during inference  of VLMs, it will exhaust computational resources. In this paper, we explore this attack surface about availability of VLMs and aim to induce high energy-latency cost during inference of VLMs. We find that high energy-latency cost during inference of VLMs can be manipulated by maximizing the length of generated sequences. To this end, we propose verbose images, with the goal of crafting an imperceptible perturbation to induce VLMs to generate long sentences during inference. Concretely, we design three loss objectives. First, a loss is proposed to delay the occurrence of end-of-sequence (EOS) token, where EOS token is a signal for VLMs to stop generating further tokens. Moreover, an uncertainty loss and a token diversity loss are proposed to increase the uncertainty over each generated token and the diversity among all tokens of the whole generated sequence, respectively, which can break output dependency at token-level and sequence-level. Furthermore, a temporal weight adjustment algorithm is proposed, which can effectively balance these losses. Extensive experiments demonstrate that our verbose images can increase the length of generated sequences by 7.87 times and 8.56 times compared to original images on MS-COCO and ImageNet datasets, which presents potential challenges for various applications.
+
+<div align=center>
+<img src="assets/verbose_images.png" width="800" height="300" alt="Pipeline of ASD"/><br/>
+</div>
+
+## Installation
+
+This code is tested on our local environment (python=3.9.2, cuda=11.6), and we recommend you to use anaconda to create a vitural environment:
+
+```bash
+conda create -n VI python=3.9.2
+```
+Then, activate the environment:
+```bash
+conda activate VI
+```
+
+Install requirements:
+
+```bash
+pip install -e .
+```
+
+## Data Preparation
+
+Please download MS-COCO dataset from its [official
+website](https://cocodataset.org/#download) and randomly select 1,000 images.
+
+## Verbose Images
+
+Run the following command to generate verbose images to induce high energy-latency cost of BLIP-2.
+
+```shell
+bash scripts/run.sh
+```
+
+## Citation
+
+```
+@inproceedings{gao2024inducing,
+  title={Inducing High Energy-Latency of Large Vision-Language Models with Verbose Images},
+  author={Gao, Kuofeng and Bai, Yang and Gu, Jindong and Xia, Shu-Tao and Torr, Philip and Li, Zhifeng and Liu, Wei},
+  booktitle={ICLR},
+  year={2024}
+}
+```
+
+## Acknowledgements
+
+This respository is mainly based on [LAVIS](https://github.com/salesforce/LAVIS) and [MiniGPT-4](https://github.com/Vision-CAIR/MiniGPT-4). Thanks for their wonderful works!
