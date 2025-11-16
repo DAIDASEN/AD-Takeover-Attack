@@ -1,6 +1,9 @@
+numpy<2.0.0
 contexttimer
 decord
-diffusers<=0.16.0
+diffusers==0.16.0
+huggingface_hub==0.17.3
+accelerate==0.20.3
 einops>=0.4.1
 fairscale==0.4.4
 ftfy
@@ -31,13 +34,13 @@ torchaudio
 soundfile
 moviepy
 nltk
-peft
+peft==0.4.0
 easydict==1.9
 pyyaml_env_tag==0.1
-open3d==0.13.0
+open3d>=0.14.1
 h5py
 wandb
 pyRAPL
-pynvml
+nvidia-ml-py3
 bitsandbytes==0.37.0
 markupsafe==2.0.1

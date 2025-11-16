@@ -7,9 +7,12 @@ License: 3-Clause BSD
 Keywords: Vision-Language,Multimodal,Image Captioning,Generative AI,Deep Learning,Library,PyTorch
 Requires-Python: >=3.7.0
 Description-Content-Type: text/markdown
+Requires-Dist: numpy<2.0.0
 Requires-Dist: contexttimer
 Requires-Dist: decord
-Requires-Dist: diffusers<=0.16.0
+Requires-Dist: diffusers==0.16.0
+Requires-Dist: huggingface_hub==0.17.3
+Requires-Dist: accelerate==0.20.3
 Requires-Dist: einops>=0.4.1
 Requires-Dist: fairscale==0.4.4
 Requires-Dist: ftfy
@@ -40,14 +43,14 @@ Requires-Dist: torchaudio
 Requires-Dist: soundfile
 Requires-Dist: moviepy
 Requires-Dist: nltk
-Requires-Dist: peft
+Requires-Dist: peft==0.4.0
 Requires-Dist: easydict==1.9
 Requires-Dist: pyyaml_env_tag==0.1
-Requires-Dist: open3d==0.13.0
+Requires-Dist: open3d>=0.14.1
 Requires-Dist: h5py
 Requires-Dist: wandb
 Requires-Dist: pyRAPL
-Requires-Dist: pynvml
+Requires-Dist: nvidia-ml-py3
 Requires-Dist: bitsandbytes==0.37.0
 Requires-Dist: markupsafe==2.0.1
 Dynamic: author
