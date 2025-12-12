@@ -4,6 +4,9 @@
 # Ignore all .pt files
 *.pt
 
+# Ignore all .json files
+*.json
+
 # Add more ignore patterns as needed
 # For example:
 *.log
