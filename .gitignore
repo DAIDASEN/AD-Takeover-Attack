@@ -1,0 +1,11 @@
+# Ignore all .mp4 files
+*.mp4
+
+# Ignore all .pt files
+*.pt
+
+# Add more ignore patterns as needed
+# For example:
+*.log
+# __pycache__/
+*.tmp
