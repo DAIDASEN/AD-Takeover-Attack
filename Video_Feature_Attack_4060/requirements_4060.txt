@@ -1,0 +1,7 @@
+torch
+transformers==4.43.1
+numpy
+opencv-python
+Pillow
+
+
