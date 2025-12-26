@@ -60,7 +60,7 @@ class DifferentiableNormalize(nn.Module):
         return (x - self.mean) / self.std
 
 # ==============================================================================
-# 3. 核心攻击逻辑 (Manual Tensor Construction)
+# 3. 核心攻击逻辑
 # ==============================================================================
 
 class SpongeAttacker:
@@ -69,12 +69,9 @@ class SpongeAttacker:
         self.processor = processor
         self.device = device
         self.args = args
-        
-        # 获取归一化参数
         image_mean = getattr(processor.image_processor, 'image_mean', [0.481, 0.457, 0.408])
         image_std = getattr(processor.image_processor, 'image_std', [0.268, 0.261, 0.275])
         self.normalizer = DifferentiableNormalize(image_mean, image_std, device)
-
         self.banned_ids = []
         if model.config.eos_token_id is not None:
             self.banned_ids.append(model.config.eos_token_id)
@@ -94,16 +91,16 @@ class SpongeAttacker:
         path = os.path.join(self.args.output_dir, filename)
         if os.path.exists(path):
             ckpt = torch.load(path, map_location=self.device)
+            # 兼容性检查：如果保存的 delta 形状和当前不同（比如 num_frames 变了），则报错或重置
             if ckpt['delta'].shape == delta_shape:
-                print(f"[Checkpoint] Resuming from step {ckpt['step']}")
+                print(f"[Checkpoint] Found valid checkpoint at {path}, loaded step {ckpt['step']}")
                 return ckpt['delta'].to(self.device), ckpt['step']
+            else:
+                print(f"[Checkpoint] Warning: Shape mismatch (Saved: {ckpt['delta'].shape}, Current: {delta_shape}). Ignoring checkpoint.")
         return None, 0
 
     def save_debug_video(self, video_tensor, filename):
-        """保存视频用于调试，打印数值范围以确保正确"""
-        # Tensor: (1, T, C, H, W) -> [0, 1]
         print(f"[Debug Save] Tensor Range: min={video_tensor.min().item():.3f}, max={video_tensor.max().item():.3f}")
-        
         vid_np = video_tensor.squeeze(0).permute(0, 2, 3, 1).detach().float().cpu().numpy()
         vid_uint8 = (vid_np * 255).clip(0, 255).astype(np.uint8)
         save_path = os.path.join(self.args.output_dir, filename)
@@ -111,39 +108,35 @@ class SpongeAttacker:
         print(f"[Debug Save] Saved to: {save_path}")
 
     def attack(self, video_frames_hd, system_prompt, target_text):
-        print("\n[Attack] Initializing Sponge Attack (Manual Tensor Mode)...")
+        print("\n[Attack] Preparing Data...")
         
-        # --- A. 手动构造输入 (Bypass Processor Normalization) ---
-        
-        # 1. Prompt 处理
+        orig_do_norm = self.processor.image_processor.do_normalize
+        self.processor.image_processor.do_normalize = False
+        self.processor.image_processor.do_rescale = True 
+
+        # 1. 构造 dummy prompt 以获取 input_ids
         conversation = [
             {"role": "user", "content": [{"type": "video"}, {"type": "text", "text": system_prompt}]},
             {"role": "assistant", "content": [{"type": "text", "text": target_text}]}
         ]
         prompt = self.processor.apply_chat_template(conversation, add_generation_prompt=False)
         
-        # 2. 让 Processor 只处理文本和占位符，不处理具体视频数据
-        # 我们传入一个假的极小视频来生成 input_ids 和 attention_mask
+        # 2. Processor 处理
         dummy_video = [np.zeros((self.args.num_frames, 336, 336, 3), dtype=np.uint8)]
         batch = self.processor(text=prompt, videos=dummy_video, return_tensors="pt").to(self.device)
         
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
         
-        # 3. 手动处理真实视频 (确保它是 0-1 范围的 Raw Pixel)
-        # Resize video to model input size (usually 336x336 for LLaVA-NeXT)
-        # Processor output usually gives clues, but for LLaVA-Video it's standard CLIP resolution.
-        # 为了安全，我们还是让 processor 跑一遍 resize，但要捕获它的输出值范围
-        
-        # 强制关闭 processor 的归一化
+        # 3. 处理真实视频
+        # 强制关闭 Processor 内部所有可能得归一化，只做 resize
         if hasattr(self.processor, "image_processor"):
             self.processor.image_processor.do_normalize = False
-            self.processor.image_processor.do_rescale = True # 0-255 -> 0-1
+            self.processor.image_processor.do_rescale = True
         if hasattr(self.processor, "video_processor"):
             self.processor.video_processor.do_normalize = False
             self.processor.video_processor.do_rescale = True
 
-        # 重新处理真实视频
         real_batch = self.processor(text=prompt, videos=[list(video_frames_hd)], return_tensors="pt").to(self.device)
         
         if "pixel_values_videos" in real_batch:
@@ -151,82 +144,68 @@ class SpongeAttacker:
         elif hasattr(real_batch, "pixel_values"):
             pixel_values_videos_clean = real_batch.pixel_values
         else:
-            raise ValueError("Cannot extract video tensor from processor.")
+            raise ValueError("Cannot extract video tensor.")
             
         pixel_values_videos_clean = pixel_values_videos_clean.to(self.model.dtype)
         
-        # === 关键检查：确保范围是 [0, 1] ===
-        v_min, v_max = pixel_values_videos_clean.min().item(), pixel_values_videos_clean.max().item()
-        print(f"[Sanity Check] Clean Video Range: min={v_min:.3f}, max={v_max:.3f}")
-        
-        if v_min < -0.5 or v_max > 1.5:
-            print("[Warning] Video seems normalized! Attempting to un-normalize manually...")
-            # 简单的反归一化尝试 (假设是 CLIP mean/std)
-            # x = (x * std) + mean
-            # 这里如果不确定，最好是手动构建 tensor
-            # 既然我们要手动构建，就不依赖 processor 的输出值了
-            
-            # 手动构建 Tensor (Batch, Time, Channel, H, W)
-            # 注意：LLaVA-NeXT 需要特定的 H, W (通常由 shortest_edge 决定)
-            # 为了保险，我们还是用 processor 的 resize 结果，但如果发现归一化了，就手动撤销
-            pass 
-            # 实际上，只要上面 do_normalize=False 设置成功，这里应该是 [0, 1]
-            # 如果不成功，可能是 transformer 版本差异。
-        
-        # 4. 获取 image_sizes
         image_sizes = real_batch.get("image_sizes")
         if image_sizes is None:
             t, h, w = pixel_values_videos_clean.shape[1], pixel_values_videos_clean.shape[3], pixel_values_videos_clean.shape[4]
             image_sizes = torch.tensor([[h, w]], device=self.device)
 
-        # 保存一下模型视角的干净视频，确认它不是黑乎乎的
-        self.save_debug_video(pixel_values_videos_clean, "debug_clean_check.mp4")
-
-        # 5. Mask Labels
+        # 4. Mask Labels
         conv_user = [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": system_prompt}]}]
         prompt_user = self.processor.apply_chat_template(conv_user, add_generation_prompt=True)
-        # 用同样的 dummy video 计算长度
         batch_user = self.processor(text=prompt_user, videos=dummy_video, return_tensors="pt")
         prompt_len = batch_user["input_ids"].shape[1]
-        
         labels = input_ids.clone()
         labels[:, :prompt_len] = -100 
 
-        # --- B. 初始化 Delta ---
+        # --- 初始化 Delta & Checkpoint ---
         delta = torch.zeros_like(pixel_values_videos_clean).to(self.device)
-        loaded_delta, start_step = self.load_checkpoint(delta.shape)
+        
+        # 尝试加载 Checkpoint
+        loaded_delta, start_step = self.load_checkpoint(delta.shape, filename="ckpt.pt")
+        
+        if loaded_delta is not None:
+            delta.data = loaded_delta
+        else:
+            if self.args.eval_only:
+                print("[Error] --eval-only set but no valid checkpoint found at 'ckpt.pt'!")
+                exit(1)
+            print("[Init] Random Noise Init...")
+            epsilon = self.args.eps / 255.0
+            delta.data.uniform_(-epsilon, epsilon)
+            delta.data = torch.clamp(pixel_values_videos_clean + delta.data, 0.0, 1.0) - pixel_values_videos_clean
+        
+        # === [核心修改] Eval Only 模式 ===
+        if self.args.eval_only:
+            print("\n" + "="*40)
+            print("[Info] Running in EVAL-ONLY mode.")
+            print(f"[Info] Checkpoint loaded from step {start_step}.")
+            print("Skipping training loop and going directly to generation.")
+            print("="*40 + "\n")
+            final_adv_video = torch.clamp(pixel_values_videos_clean + delta, 0.0, 1.0)
+            return final_adv_video
+        # ================================
+
+        delta.requires_grad = True
+        self.model.train()
+        self.model.requires_grad_(False) 
+        loss_fct = nn.CrossEntropyLoss()
         
         epsilon = self.args.eps / 255.0
         alpha = self.args.alpha / 255.0 
 
-        if loaded_delta is not None:
-            delta.data = loaded_delta
-            print(f"[Resume] Step {start_step}")
-        else:
-            print("[Init] Random Noise Init...")
-            delta.data.uniform_(-epsilon, epsilon)
-            delta.data = torch.clamp(pixel_values_videos_clean + delta.data, 0.0, 1.0) - pixel_values_videos_clean
-        
-        delta.requires_grad = True
-        
-        self.model.train()
-        self.model.requires_grad_(False) 
-        loss_fct = nn.CrossEntropyLoss()
+        print(f"Starting PGD. Eps: {self.args.eps}/255, Steps: {self.args.steps}")
 
-        print(f"Starting PGD. Eps: {self.args.eps}/255")
-
-        # --- C. 攻击循环 ---
         for step in range(start_step, self.args.steps):
             if delta.grad is not None: delta.grad.zero_()
             
-            # 1. 叠加
             adv_video = pixel_values_videos_clean + delta
-            adv_video = torch.clamp(adv_video, 0.0, 1.0) # 保持在 [0, 1]
-            
-            # 2. 归一化 (Input to Model)
+            adv_video = torch.clamp(adv_video, 0.0, 1.0)
             normalized_video = self.normalizer(adv_video)
             
-            # 3. Forward
             try:
                 outputs = self.model(
                     input_ids=input_ids,
@@ -244,7 +223,6 @@ class SpongeAttacker:
                     use_cache=False
                 )
 
-            # 4. Loss
             logits = outputs.logits.float()
             vocab_size = logits.size(-1)
             shift_logits = logits[..., :-1, :].contiguous()
@@ -262,13 +240,12 @@ class SpongeAttacker:
 
             if step % 10 == 0:
                 print(f"Step [{step}] Loss: {loss.item():.4f} (T: {target_loss.item():.4f}, P: {penalty_val.item():.4f})")
-                self.save_checkpoint(delta, step)
+                self.save_checkpoint(delta, step, filename="ckpt.pt")
 
             loss.backward()
             
             if delta.grad is None or torch.isnan(delta.grad).any(): continue
 
-            # 5. Update
             with torch.no_grad():
                 grad_sign = delta.grad.sign()
                 delta.data = delta.data - alpha * grad_sign
@@ -276,6 +253,7 @@ class SpongeAttacker:
                 delta.data = torch.clamp(pixel_values_videos_clean + delta.data, 0.0, 1.0) - pixel_values_videos_clean
                 delta.grad.zero_()
 
+        self.save_checkpoint(delta, self.args.steps, filename="ckpt.pt")
         final_adv_video = torch.clamp(pixel_values_videos_clean + delta, 0.0, 1.0)
         return final_adv_video
 
@@ -294,6 +272,8 @@ def main():
     parser.add_argument("--num-frames", type=int, default=16)
     parser.add_argument("--save-original-size", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    # === [新增参数] Eval Only ===
+    parser.add_argument("--eval-only", action="store_true", help="Skip training, load ckpt.pt and generate video")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -319,20 +299,24 @@ def main():
     
     attacker = SpongeAttacker(model, processor, device, args)
     
-    # 攻击得到的是模型视角的小尺寸视频 tensor (0-1 float)
+    # 攻击/生成
     adv_video_tensor = attacker.attack(video_frames_hd, SYSTEM_PROMPT, SPONGE_TARGET)
     
-    # 保存模型视角的攻击视频
+    # 保存低分辨率模型视角视频
     attacker.save_debug_video(adv_video_tensor, "adv_model_view_final.mp4")
 
-    # 还原高清 (Upscale)
+    # 还原高清 (Upscale) - 修复偶数尺寸
     if args.save_original_size:
-        print(f"[Save] Restoring to {orig_w}x{orig_h}...")
+        print(f"[Save] Restoring to original resolution...")
+        save_h, save_w = orig_h, orig_w
+        if save_h % 2 != 0: save_h -= 1
+        if save_w % 2 != 0: save_w -= 1
+        
         adv_float = adv_video_tensor.detach().float()
         b, t, c, h, w = adv_float.shape
         adv_2d = adv_float.view(b * t, c, h, w)
-        adv_up = F.interpolate(adv_2d, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
-        adv_up = adv_up.view(b, t, c, orig_h, orig_w).clamp(0.0, 1.0)
+        adv_up = F.interpolate(adv_2d, size=(save_h, save_w), mode="bilinear", align_corners=False)
+        adv_up = adv_up.view(b, t, c, save_h, save_w).clamp(0.0, 1.0)
         
         adv_up_np = adv_up.squeeze(0).permute(0, 2, 3, 1).cpu().numpy()
         adv_up_uint8 = (adv_up_np * 255).clip(0, 255).astype(np.uint8)
