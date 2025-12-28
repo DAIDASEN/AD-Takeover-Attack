@@ -265,7 +265,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--video-path", type=str, required=True)
     parser.add_argument("--model-path", type=str, default="llava-hf/LLaVA-NeXT-Video-7B-hf")
-    parser.add_argument("--output-dir", type=str, default="verbose_results_v5")
+    parser.add_argument("--output-dir", type=str, default="verbose_results_noise")
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--eps", type=float, default=4.0)

@@ -1,2 +1,0 @@
-USER: 
-Does this driving scenario require a manual takeover? Please answer Yes or No. ASSISTANT: No.
