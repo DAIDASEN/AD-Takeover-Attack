@@ -164,6 +164,19 @@ def main():
     parser.add_argument("--eps", type=float, default=8.0)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--num-frames", type=int, default=16)
+    parser.add_argument(
+        "--skip-existing",
+        dest="skip_existing",
+        action="store_true",
+        help="Skip videos that already have <output-dir>/<video_id>/log.json",
+    )
+    parser.add_argument(
+        "--no-skip-existing",
+        dest="skip_existing",
+        action="store_false",
+        help="Re-run even if <output-dir>/<video_id>/log.json exists",
+    )
+    parser.set_defaults(skip_existing=True)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -188,14 +201,30 @@ def main():
     std_tensor = torch.tensor(OPENAI_CLIP_STD, device=device).view(1, 3, 1, 1)
 
     all_videos = sorted([f for f in os.listdir(args.data_root) if f.lower().endswith(".mp4")])
-    target_videos = all_videos[:args.limit]
 
     attacker = SpongeAttacker(model, processor, device, args)
-    summary_results = []
+    summary_by_video_id = {}
+    skipped_count = 0
+    processed_count = 0
 
-    for video_name in tqdm(target_videos, desc="Batch Processing"):
+    for video_name in tqdm(all_videos, desc="Batch Processing"):
+        if processed_count >= args.limit:
+            break
+
         video_id = os.path.splitext(video_name)[0]
         video_dir = os.path.join(args.output_dir, video_id)
+        log_path = os.path.join(video_dir, "log.json")
+
+        if args.skip_existing and os.path.isfile(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    summary_by_video_id[video_id] = json.load(f)
+                tqdm.write(f"[Skip] {video_name} (found {log_path})")
+                skipped_count += 1
+                continue
+            except Exception as e:
+                tqdm.write(f"[Warn] Failed to read existing log for {video_name}: {e}; re-running.")
+
         os.makedirs(video_dir, exist_ok=True)
 
         video_path = os.path.join(args.data_root, video_name)
@@ -259,13 +288,16 @@ def main():
         }
         with open(os.path.join(video_dir, "log.json"), "w", encoding="utf-8") as f:
             json.dump(comparison, f, indent=4, ensure_ascii=False)
-        summary_results.append(comparison)
+        summary_by_video_id[video_id] = comparison
+        processed_count += 1
         
         del adv_tensor_norm, inputs_orig, inputs_adv
         torch.cuda.empty_cache()
 
+    summary_results = [summary_by_video_id[k] for k in sorted(summary_by_video_id)]
     with open(os.path.join(args.output_dir, "final_summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary_results, f, indent=4, ensure_ascii=False)
+    print(f"\nDone! Attacked {processed_count} new videos, reused {skipped_count} existing results.")
 
 if __name__ == "__main__":
     main()
