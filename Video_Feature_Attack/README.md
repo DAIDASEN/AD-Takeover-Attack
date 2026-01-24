@@ -1,6 +1,6 @@
 # Video Feature Attack（视频特征攻击）
 
-本目录包含两类针对 `LLaVA-NeXT-Video` 的视频输入对抗攻击脚本，并把每个视频的结果落盘到 `output-dir/<video_id>/`，方便断点续跑/复用结果。
+本目录包含多类针对 `LLaVA-NeXT-Video` 的视频输入对抗攻击脚本，并把每个视频的结果落盘到 `output-dir/<video_id>/`，方便断点续跑/复用结果。
 
 ## 1) Sponge Attack：`1_attack_sponge.py`
 
@@ -16,7 +16,7 @@
 ```bash
 python 1_attack_sponge.py \
   --data-root BDDX/Sample \
-  --output-dir results_sponge_sample \
+  --output-dir results/Llama/results_sponge_sample \
   --limit 20 \
   --steps 150 \
   --num-frames 16
@@ -37,10 +37,83 @@ python 1_attack_sponge.py \
 ```bash
 python 2_attack_misinfo.py \
   --data-root BDDX \
-  --output-dir results_auto_flip \
+  --output-dir results/Llama/results_auto_flip \
   --limit 20 \
   --steps 200 \
   --num-frames 16
+```
+
+## 3) Universal Sponge（通用扰动/通用 Patch）：`3_unified_sponge.py`
+
+- 目标：学习一个“通用”的视频扰动（UAP 或 trigger patch），让不同视频在同一个提问下都倾向输出更长的 `SPONGE_TARGET`（可用于可用性/延迟型攻击的放大）。
+- 支持模式：
+  - `--attack-mode uap_delta`：整帧加性通用扰动（可选 `--delta-mode shared_time/full_time`）
+  - `--attack-mode patch_delta`：局部 patch 的加性通用扰动
+  - `--attack-mode patch_replace`：学习一个“替换式”trigger patch（默认）
+- 输出：
+  - `output-dir/universal_params.pt`：训练得到的通用参数（用于复用/跨数据集）
+  - `output-dir/eval/<video_id>/log.json`：每个视频攻击前后回答与长度对比
+  - `output-dir/timing_summary_eval.json`：推理耗时对比统计
+
+训练 + 同数据集评测示例（默认行为）：
+
+```bash
+python 3_unified_sponge.py \
+  --stage train_eval \
+  --data-root BDDX/videos \
+  --output-dir results/Llama/results_bddx_universal_sponge \
+  --num-train-videos 200 \
+  --num-eval-videos 100 \
+  --uap-epochs 10 \
+  --uap-iters-per-video 15 \
+  --num-frames 16
+```
+
+如果要换用 Video-LLaVA + 自动驾驶微调 adapter（例如 BDD-X）：
+
+```bash
+python 3_unified_sponge.py \
+  --model-family video_llava \
+  --model-path LanguageBind/Video-LLaVA-7B-hf \
+  --adapter-path saychuwho/videollava_BDD-X-v1 \
+  ...
+```
+
+## 4) Cross-Dataset（跨数据集）评测：复用 `universal_params.pt`
+
+跨数据集评测不需要重新训练：直接加载在 Source 数据集上训练好的 `universal_params.pt`，在 Target 数据集上跑 `eval_only` 即可。
+
+示例：在 BDDX 上训练的通用参数 → 在 DD 上评测：
+
+```bash
+python 3_unified_sponge.py \
+  --stage eval_only \
+  --load-params results/Llama/results_bddx_universal_sponge/universal_params.pt \
+  --eval-data-root DD \
+  --output-dir results/Llama/results_cross_bddx_to_dd \
+  --num-eval-videos 20 \
+  --num-frames 16
+```
+
+反向：在 DD 上训练的通用参数 → 在 BDDX 上评测：
+
+```bash
+python 3_unified_sponge.py \
+  --stage eval_only \
+  --load-params results/Llama/results_DD_universal_sponge/universal_params.pt \
+  --eval-data-root BDDX/videos \
+  --output-dir results/Llama/results_cross_dd_to_bddx \
+  --num-eval-videos 100 \
+  --num-frames 16
+```
+
+对比两次跨数据集评测的 token 与延迟（读取各自的 `final_summary_eval.json` + `timing_summary_eval.json`）：
+
+```bash
+python summarize_cross_dataset_eval.py \
+  --run bddx_to_dd results/Llama/results_cross_bddx_to_dd \
+  --run dd_to_bddx results/Llama/results_cross_dd_to_bddx \
+  --out results/Llama/results_cross_reports
 ```
 
 ## 断点续跑 / 复用结果（跳过已攻击视频）
@@ -72,4 +145,3 @@ pip install -r requirements_4060.txt
 ```bash
 pip install av tqdm accelerate
 ```
-

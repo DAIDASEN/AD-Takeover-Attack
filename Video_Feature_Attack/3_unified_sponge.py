@@ -57,6 +57,103 @@ def list_videos(data_root: str) -> List[str]:
     vids.sort()
     return vids
 
+def apply_chat_template(processor, conv: List[Dict[str, Any]], add_generation_prompt: bool) -> str:
+    if hasattr(processor, "apply_chat_template"):
+        try:
+            return processor.apply_chat_template(conv, add_generation_prompt=add_generation_prompt)
+        except Exception:
+            pass
+    tok = getattr(processor, "tokenizer", None)
+    if tok is not None and hasattr(tok, "apply_chat_template"):
+        try:
+            return tok.apply_chat_template(conv, tokenize=False, add_generation_prompt=add_generation_prompt)
+        except Exception:
+            pass
+
+    # Very conservative fallback (may not match model's preferred formatting).
+    lines: List[str] = []
+    for msg in conv:
+        role = str(msg.get("role", "")).upper()
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for it in content:
+                if isinstance(it, dict) and it.get("type") == "video":
+                    parts.append("<video>")
+                elif isinstance(it, dict) and it.get("type") == "text":
+                    parts.append(str(it.get("text", "")))
+            text = "\n".join([p for p in parts if p])
+        else:
+            text = str(content)
+        lines.append(f"{role}: {text}".strip())
+    if add_generation_prompt:
+        lines.append("ASSISTANT:")
+    return "\n".join(lines).strip()
+
+def decode_text(processor, token_ids: torch.Tensor) -> str:
+    if hasattr(processor, "decode"):
+        try:
+            return processor.decode(token_ids, skip_special_tokens=True)
+        except Exception:
+            pass
+    tok = getattr(processor, "tokenizer", None)
+    if tok is not None and hasattr(tok, "decode"):
+        return tok.decode(token_ids, skip_special_tokens=True)
+    return str(token_ids)
+
+def get_image_mean_std(processor) -> Tuple[List[float], List[float]]:
+    ip = getattr(processor, "image_processor", None)
+    mean = getattr(ip, "image_mean", None)
+    std = getattr(ip, "image_std", None)
+    if isinstance(mean, (list, tuple)) and isinstance(std, (list, tuple)) and len(mean) == 3 and len(std) == 3:
+        return list(mean), list(std)
+    return OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
+
+def get_pixel_values_key(batch: Dict[str, Any]) -> str:
+    if "pixel_values_videos" in batch:
+        return "pixel_values_videos"
+    if "pixel_values" in batch:
+        return "pixel_values"
+    raise KeyError(f"Cannot find pixel values in batch keys: {list(batch.keys())}")
+
+def load_video_llm_backend(model_path: str, model_family: str, torch_dtype):
+    if model_family == "llava_next_video":
+        processor = LlavaNextVideoProcessor.from_pretrained(model_path, use_fast=True)
+        model = LlavaNextVideoForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            device_map="auto",
+        )
+        return model, processor
+
+    if model_family == "video_llava":
+        try:
+            from transformers import VideoLlavaForConditionalGeneration, VideoLlavaProcessor
+        except Exception as e:
+            raise RuntimeError(
+                "Video-LLaVA backend requires transformers with VideoLlava* classes. "
+                "Try upgrading transformers in your conda env."
+            ) from e
+        processor = VideoLlavaProcessor.from_pretrained(model_path, use_fast=True)
+        model = VideoLlavaForConditionalGeneration.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            device_map="auto",
+        )
+        return model, processor
+
+    raise ValueError(f"Unknown --model-family: {model_family}")
+
+def sample_videos(all_videos: List[str], n: int, seed: int) -> List[str]:
+    """
+    Sample n videos from all_videos with a fixed seed.
+    If n <= 0 or n >= len(all_videos), return all videos.
+    """
+    if n <= 0 or n >= len(all_videos):
+        return sorted(all_videos)
+    rng = random.Random(seed)
+    return sorted(rng.sample(all_videos, k=min(n, len(all_videos))))
+
 def split_train_eval(all_videos: List[str],
                      n_train: int,
                      n_eval: int,
@@ -173,6 +270,21 @@ def stats(xs: List[float]) -> Dict[str, float]:
         "p95": float(np.percentile(arr, 95)),
     }
 
+def safe_div(num: float, den: float, default: float = 0.0) -> float:
+    try:
+        if den == 0:
+            return default
+        return float(num) / float(den)
+    except Exception:
+        return default
+
+def count_text_tokens(tokenizer, text: str) -> int:
+    try:
+        ids = tokenizer(text, add_special_tokens=False).input_ids
+        return int(len(ids))
+    except Exception:
+        return 0
+
 
 # ==============================================================================
 # Timing
@@ -183,6 +295,8 @@ class Timing:
     gen_before_s: float = 0.0
     apply_attack_s: float = 0.0
     gen_after_s: float = 0.0
+    gen_before_new_tokens: int = 0
+    gen_after_new_tokens: int = 0
 
     @property
     def total_before_s(self) -> float:
@@ -207,8 +321,12 @@ class UniversalSpongeTrainer:
         self.device = device
         self.args = args
 
-        self.mean = torch.tensor(OPENAI_CLIP_MEAN, device=device).view(1, 3, 1, 1)
-        self.std  = torch.tensor(OPENAI_CLIP_STD,  device=device).view(1, 3, 1, 1)
+        image_mean, image_std = get_image_mean_std(processor)
+        self.image_mean = image_mean
+        self.image_std = image_std
+
+        self.mean = torch.tensor(image_mean, device=device).view(1, 3, 1, 1)
+        self.std  = torch.tensor(image_std,  device=device).view(1, 3, 1, 1)
         self.std_bc = self.std.view(1, 1, 3, 1, 1)  # broadcast for eps/alpha
 
         # normalized eps/alpha (for additive modes)
@@ -239,10 +357,10 @@ class UniversalSpongeTrainer:
             {"role": "user", "content": [{"type": "video"}, {"type": "text", "text": SYSTEM_PROMPT}]},
             {"role": "assistant", "content": [{"type": "text", "text": SPONGE_TARGET}]},
         ]
-        prompt_full = self.processor.apply_chat_template(conv_target, add_generation_prompt=False)
+        prompt_full = apply_chat_template(self.processor, conv_target, add_generation_prompt=False)
 
         conv_user = [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": SYSTEM_PROMPT}]}]
-        prompt_user = self.processor.apply_chat_template(conv_user, add_generation_prompt=True)
+        prompt_user = apply_chat_template(self.processor, conv_user, add_generation_prompt=True)
         return prompt_full, prompt_user
 
     def _ensure_prompt_len(self, frames_uint8: np.ndarray):
@@ -260,7 +378,8 @@ class UniversalSpongeTrainer:
 
         # run processor once to get H,W,T
         batch0 = self.processor(text=self.prompt_user, videos=[list(frames_uint8)], return_tensors="pt").to(self.device)
-        pv0 = batch0["pixel_values_videos"].to(self.model.dtype)  # (1,T,3,H,W)
+        pv_key = get_pixel_values_key(batch0)
+        pv0 = batch0[pv_key].to(self.model.dtype)  # (1,T,3,H,W)
         _, T, _, H, W = pv0.shape
 
         params: Dict[str, torch.Tensor] = {}
@@ -334,25 +453,33 @@ class UniversalSpongeTrainer:
             if delta_u.shape[1] == 1:
                 delta = delta_u.repeat(1, T, 1, 1, 1)
             else:
+                if delta_u.shape[1] != T:
+                    raise ValueError(
+                        f"uap_delta time dim mismatch: delta_u has T={delta_u.shape[1]} but current T={T}. "
+                        f"Use the same --num-frames as training, or train with --delta-mode shared_time."
+                    )
                 delta = delta_u
             return pixel_clean + delta
 
         # patch-based
         ph, pw = self.args.patch_h, self.args.patch_w
-        top, left = self._make_patch_coords(H, W)
+        ph_eff, pw_eff = min(int(ph), int(H)), min(int(pw), int(W))
+        top, left = self._make_patch_coords(H, W) if (ph_eff == ph and pw_eff == pw) else (0, 0)
 
         if mode == "patch_delta":
             pdelta = params["patch_delta"]  # (1,1,3,ph,pw)
+            pdelta = pdelta[..., :ph_eff, :pw_eff]
             pdeltaT = pdelta.repeat(1, T, 1, 1, 1)
             adv = pixel_clean.clone()
-            adv[:, :, :, top:top+ph, left:left+pw] = adv[:, :, :, top:top+ph, left:left+pw] + pdeltaT
+            adv[:, :, :, top:top+ph_eff, left:left+pw_eff] = adv[:, :, :, top:top+ph_eff, left:left+pw_eff] + pdeltaT
             return adv
 
         if mode == "patch_replace":
             patch = params["patch"]  # (1,1,3,ph,pw)
+            patch = patch[..., :ph_eff, :pw_eff]
             patchT = patch.repeat(1, T, 1, 1, 1)
             adv = pixel_clean.clone()
-            adv[:, :, :, top:top+ph, left:left+pw] = patchT
+            adv[:, :, :, top:top+ph_eff, left:left+pw_eff] = patchT
             return adv
 
         raise ValueError(f"Unknown attack_mode: {mode}")
@@ -489,12 +616,15 @@ class UniversalSpongeTrainer:
                 # build batch for prompt_full (teacher forcing target)
                 batch = self.processor(text=self.prompt_full, videos=[list(frames)], return_tensors="pt").to(self.device)
                 input_ids = batch["input_ids"]  # (1,L)
+                attention_mask = batch.get("attention_mask")
+                image_sizes = batch.get("image_sizes")
 
                 self._ensure_prompt_len(frames)
                 labels = input_ids.clone()
                 labels[:, :self.prompt_len] = -100
 
-                pixel_clean = batch["pixel_values_videos"].to(self.model.dtype)  # (1,T,3,H,W)
+                pv_key = get_pixel_values_key(batch)
+                pixel_clean = batch[pv_key].to(self.model.dtype)  # (1,T,3,H,W)
 
                 for _ in range(self.args.uap_iters_per_video):
                     # zero grads
@@ -505,7 +635,22 @@ class UniversalSpongeTrainer:
                     # forward on adversarial pixels
                     pixel_adv = self._apply_attack(pixel_clean, params)
 
-                    outputs = self.model(input_ids=input_ids, pixel_values_videos=pixel_adv, use_cache=False)
+                    try:
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            pixel_values_videos=pixel_adv,
+                            image_sizes=image_sizes,
+                            use_cache=False,
+                        )
+                    except TypeError:
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            pixel_values=pixel_adv,
+                            image_sizes=image_sizes,
+                            use_cache=False,
+                        )
                     logits = outputs.logits.float()
 
                     loss = self._compute_loss(logits, labels)
@@ -540,11 +685,30 @@ class UniversalSpongeTrainer:
     def generate(self, frames_uint8: np.ndarray, pixel_override: Optional[torch.Tensor] = None) -> str:
         inputs = self.processor(text=self.prompt_user, videos=[list(frames_uint8)], return_tensors="pt").to(self.device)
         if pixel_override is not None:
-            inputs["pixel_values_videos"] = pixel_override
-            if "pixel_values" in inputs:
+            pv_key = get_pixel_values_key(inputs)
+            inputs[pv_key] = pixel_override
+            # ensure only one key exists
+            if pv_key != "pixel_values_videos" and "pixel_values_videos" in inputs:
+                del inputs["pixel_values_videos"]
+            if pv_key != "pixel_values" and "pixel_values" in inputs:
                 del inputs["pixel_values"]
         out = self.model.generate(**inputs, max_new_tokens=self.args.max_new_tokens, do_sample=False)
-        return self.processor.decode(out[0], skip_special_tokens=True)
+        return decode_text(self.processor, out[0])
+
+    @torch.no_grad()
+    def generate_with_new_tokens(self, frames_uint8: np.ndarray, pixel_override: Optional[torch.Tensor] = None) -> Tuple[str, int]:
+        inputs = self.processor(text=self.prompt_user, videos=[list(frames_uint8)], return_tensors="pt").to(self.device)
+        if pixel_override is not None:
+            pv_key = get_pixel_values_key(inputs)
+            inputs[pv_key] = pixel_override
+            if pv_key != "pixel_values_videos" and "pixel_values_videos" in inputs:
+                del inputs["pixel_values_videos"]
+            if pv_key != "pixel_values" and "pixel_values" in inputs:
+                del inputs["pixel_values"]
+        prompt_len = int(inputs["input_ids"].shape[1])
+        out = self.model.generate(**inputs, max_new_tokens=self.args.max_new_tokens, do_sample=False)
+        new_tokens = int(max(0, int(out.shape[1]) - prompt_len))
+        return decode_text(self.processor, out[0]), new_tokens
 
     @torch.no_grad()
     def build_adv_pixels_for_eval(self, frames_uint8: np.ndarray, params: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -552,7 +716,8 @@ class UniversalSpongeTrainer:
         Return pixel_adv_norm (1,T,3,H,W) for evaluation prompt_user.
         """
         batch = self.processor(text=self.prompt_user, videos=[list(frames_uint8)], return_tensors="pt").to(self.device)
-        pixel_clean = batch["pixel_values_videos"].to(self.model.dtype)
+        pv_key = get_pixel_values_key(batch)
+        pixel_clean = batch[pv_key].to(self.model.dtype)
         pixel_adv = self._apply_attack(pixel_clean, params)
 
         # optional clamp to valid normalized range
@@ -566,12 +731,53 @@ class UniversalSpongeTrainer:
 def main():
     parser = argparse.ArgumentParser()
 
+    parser.add_argument(
+        "--stage",
+        type=str,
+        default="train_eval",
+        choices=["train_eval", "eval_only"],
+        help="train_eval: train universal params then eval; eval_only: load params and eval on a dataset (for cross-dataset).",
+    )
+
     parser.add_argument("--data-root", type=str,
                         default="~/daidasen/AD-Takeover-Attack/Video_Feature_Attack/BDDX/videos")
+    parser.add_argument(
+        "--eval-data-root",
+        type=str,
+        default=None,
+        help="Optional eval dataset root (folder of .mp4). If omitted, uses --data-root. "
+             "Use this for cross-dataset eval (train on --data-root, eval on --eval-data-root).",
+    )
     parser.add_argument("--output-dir", type=str,
                         default="~/daidasen/AD-Takeover-Attack/Video_Feature_Attack/results_bddx_universal_sponge")
+    parser.add_argument(
+        "--load-params",
+        type=str,
+        default=None,
+        help="Path to a saved universal_params.pt. Required when --stage=eval_only.",
+    )
+    parser.add_argument(
+        "--eval-list-file",
+        type=str,
+        default=None,
+        help="Optional text file listing eval .mp4 filenames (one per line). If omitted, samples from eval dataset.",
+    )
 
+    parser.add_argument(
+        "--model-family",
+        type=str,
+        default="llava_next_video",
+        choices=["llava_next_video", "video_llava"],
+        help="Which HF backend to use. video_llava enables Video-LLaVA (e.g., LanguageBind/Video-LLaVA-7B-hf).",
+    )
     parser.add_argument("--model-path", type=str, default="llava-hf/LLaVA-NeXT-Video-7B-hf")
+    parser.add_argument(
+        "--adapter-path",
+        type=str,
+        default=None,
+        help="Optional PEFT adapter path (e.g., saychuwho/videollava_BDD-X-v1). "
+             "If set, it will be loaded on top of --model-path.",
+    )
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])
 
     parser.add_argument("--num-train-videos", type=int, default=200)
@@ -629,6 +835,7 @@ def main():
     seed_all(args.seed)
 
     data_root = expanduser(args.data_root)
+    eval_data_root = expanduser(args.eval_data_root) if args.eval_data_root else data_root
     output_dir = expanduser(args.output_dir)
     safe_makedirs(output_dir)
 
@@ -637,25 +844,107 @@ def main():
     torch_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 
     print(f"[Init] device={device}, dtype={args.dtype}")
-    print(f"[Init] Loading processor/model from: {args.model_path}")
+    print(f"[Init] Loading backend={args.model_family} from: {args.model_path}")
 
-    processor = LlavaNextVideoProcessor.from_pretrained(args.model_path, use_fast=True)
-    model = LlavaNextVideoForConditionalGeneration.from_pretrained(
-        args.model_path,
-        torch_dtype=torch_dtype,
-        device_map="auto"
-    )
-    model.gradient_checkpointing_enable()
+    model, processor = load_video_llm_backend(args.model_path, args.model_family, torch_dtype=torch_dtype)
+    if args.adapter_path:
+        try:
+            from peft import PeftModel
+        except Exception as e:
+            raise RuntimeError(
+                "You set --adapter-path but peft is not available in this env. "
+                "Install it in your current conda env, e.g.: `pip install -U peft` "
+                "(often also: `pip install -U accelerate`)."
+            ) from e
+        print(f"[Init] Loading adapter: {args.adapter_path}")
+        model = PeftModel.from_pretrained(model, args.adapter_path)
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
     model.eval()
 
-    all_videos = list_videos(data_root)
-    train_list, eval_list = split_train_eval(
-        all_videos,
-        n_train=args.num_train_videos,
-        n_eval=args.num_eval_videos,
-        seed=args.seed,
-        eval_from_train=args.eval_from_train
-    )
+    # --------------------------------------------------------------------------
+    # Stage dispatch
+    # --------------------------------------------------------------------------
+    params: Dict[str, torch.Tensor]
+    train_list: List[str]
+    eval_list: List[str]
+    train_meta: Dict[str, Any] = {}
+
+    if args.stage == "eval_only":
+        if not args.load_params:
+            raise ValueError("--load-params is required when --stage=eval_only")
+
+        ckpt_path = expanduser(args.load_params)
+        print(f"[EvalOnly] Loading universal params from: {ckpt_path}")
+        save_obj = torch.load(ckpt_path, map_location="cpu")
+
+        # Align critical config with checkpoint (to avoid shape mismatches)
+        if "attack_mode" in save_obj:
+            args.attack_mode = save_obj["attack_mode"]
+        if "delta_mode" in save_obj:
+            args.delta_mode = save_obj["delta_mode"]
+        ckpt_args = save_obj.get("args", {})
+        if isinstance(ckpt_args, dict):
+            args.num_frames = int(ckpt_args.get("num_frames", args.num_frames))
+            args.patch_h = int(ckpt_args.get("patch_h", args.patch_h))
+            args.patch_w = int(ckpt_args.get("patch_w", args.patch_w))
+            args.patch_loc = str(ckpt_args.get("patch_loc", args.patch_loc))
+            args.patch_random_loc = bool(ckpt_args.get("patch_random_loc", args.patch_random_loc))
+
+        params = {k: save_obj[k] for k in ("delta_u", "patch_delta", "patch") if k in save_obj}
+        if not params:
+            raise ValueError(f"No params found in checkpoint: {ckpt_path}")
+
+        train_list = []
+        if args.eval_list_file:
+            with open(expanduser(args.eval_list_file), "r", encoding="utf-8") as f:
+                eval_list = [ln.strip() for ln in f if ln.strip()]
+        else:
+            eval_all = list_videos(eval_data_root)
+            eval_list = sample_videos(eval_all, n=args.num_eval_videos, seed=args.seed + 1337)
+
+        train_meta = {
+            "stage": "eval_only",
+            "loaded_from": ckpt_path,
+            "checkpoint_attack_mode": save_obj.get("attack_mode"),
+            "checkpoint_delta_mode": save_obj.get("delta_mode"),
+        }
+
+        # Persist provenance
+        with open(os.path.join(output_dir, "loaded_params_meta.json"), "w", encoding="utf-8") as f:
+            json.dump(train_meta, f, indent=2, ensure_ascii=False)
+
+    else:
+        if args.eval_from_train and eval_data_root != data_root:
+            print("[Warn] --eval-from-train ignored because --eval-data-root differs from --data-root.")
+            args.eval_from_train = False
+
+        all_train = list_videos(data_root)
+        all_eval = list_videos(eval_data_root)
+
+        if args.eval_from_train:
+            train_list, eval_list = split_train_eval(
+                all_train,
+                n_train=args.num_train_videos,
+                n_eval=args.num_eval_videos,
+                seed=args.seed,
+                eval_from_train=True
+            )
+        else:
+            if eval_data_root == data_root:
+                # Preserve the original behavior: sample train/eval without overlap.
+                train_list, eval_list = split_train_eval(
+                    all_train,
+                    n_train=args.num_train_videos,
+                    n_eval=args.num_eval_videos,
+                    seed=args.seed,
+                    eval_from_train=False
+                )
+            else:
+                # Cross-dataset: sample independently from each dataset.
+                train_list = sample_videos(all_train, n=args.num_train_videos, seed=args.seed)
+                eval_list = sample_videos(all_eval, n=args.num_eval_videos, seed=args.seed + 1337)
 
     with open(os.path.join(output_dir, "train_videos.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(train_list) + "\n")
@@ -664,40 +953,51 @@ def main():
 
     trainer = UniversalSpongeTrainer(model, processor, device, args)
 
-    # Train universal params
-    train_paths = [os.path.join(data_root, v) for v in train_list]
-    print(f"[Train] mode={args.attack_mode}, train_videos={len(train_paths)}")
-    cuda_sync()
-    params, train_meta = trainer.train(train_paths)
+    params_path: Optional[str] = None
+    if args.stage != "eval_only":
+        # Train universal params
+        train_paths = [os.path.join(data_root, v) for v in train_list]
+        print(f"[Train] mode={args.attack_mode}, train_videos={len(train_paths)}")
+        cuda_sync()
+        params, train_meta = trainer.train(train_paths)
 
-    # Save params
-    save_obj = {
-        "attack_mode": args.attack_mode,
-        "delta_mode": args.delta_mode,
-        "args": vars(args),
-        "train_meta": train_meta,
-        "train_videos": train_list,
-        "eval_videos": eval_list,
-        "mean": OPENAI_CLIP_MEAN,
-        "std": OPENAI_CLIP_STD,
-    }
-    # tensors
-    for k, v in params.items():
-        save_obj[k] = v.detach().cpu()
+        # Save params
+        save_obj = {
+            "attack_mode": args.attack_mode,
+            "delta_mode": args.delta_mode,
+            "args": vars(args),
+            "train_meta": train_meta,
+            "train_videos": train_list,
+            "eval_videos": eval_list,
+            "mean": trainer.image_mean,
+            "std": trainer.image_std,
+        }
+        # tensors
+        for k, v in params.items():
+            save_obj[k] = v.detach().cpu()
 
-    params_path = os.path.join(output_dir, "universal_params.pt")
-    torch.save(save_obj, params_path)
-    print(f"[Train] saved params to: {params_path}")
+        params_path = os.path.join(output_dir, "universal_params.pt")
+        torch.save(save_obj, params_path)
+        print(f"[Train] saved params to: {params_path}")
+    else:
+        # Keep a consistent name in final prints
+        params_path = expanduser(args.load_params) if args.load_params else None
 
     # Eval
-    mean_t = torch.tensor(OPENAI_CLIP_MEAN, device=device).view(1, 3, 1, 1)
-    std_t  = torch.tensor(OPENAI_CLIP_STD, device=device).view(1, 3, 1, 1)
+    mean_t = torch.tensor(trainer.image_mean, device=device).view(1, 3, 1, 1)
+    std_t  = torch.tensor(trainer.image_std,  device=device).view(1, 3, 1, 1)
 
     summary: Dict[str, Any] = {}
     corrupt: List[str] = []
     timings: List[Timing] = []
     success_contains_however = 0
     success_longer = 0
+    before_new_tokens_list: List[int] = []
+    after_new_tokens_list: List[int] = []
+    token_ratio_list: List[float] = []
+    before_text_tokens_list: List[int] = []
+    after_text_tokens_list: List[int] = []
+    text_token_ratio_list: List[float] = []
 
     pbar = tqdm(eval_list, desc="Eval (before/after)")
     for video_name in pbar:
@@ -715,7 +1015,7 @@ def main():
             except Exception:
                 pass
 
-        vpath = os.path.join(data_root, video_name)
+        vpath = os.path.join(eval_data_root, video_name)
 
         # preprocess time (decode)
         t_pre0 = now()
@@ -730,9 +1030,10 @@ def main():
 
         # before generate
         cuda_sync(); t0 = now()
-        raw_before = trainer.generate(frames, pixel_override=None)
+        raw_before, before_new_tokens = trainer.generate_with_new_tokens(frames, pixel_override=None)
         cuda_sync(); t1 = now()
         tinfo.gen_before_s = float(t1 - t0)
+        tinfo.gen_before_new_tokens = int(before_new_tokens)
 
         # apply universal attack
         cuda_sync(); t2 = now()
@@ -747,9 +1048,10 @@ def main():
 
         # after generate
         cuda_sync(); t4 = now()
-        raw_after = trainer.generate(frames, pixel_override=pixel_adv)
+        raw_after, after_new_tokens = trainer.generate_with_new_tokens(frames, pixel_override=pixel_adv)
         cuda_sync(); t5 = now()
         tinfo.gen_after_s = float(t5 - t4)
+        tinfo.gen_after_new_tokens = int(after_new_tokens)
 
         before_ans = extract_assistant(raw_before)
         after_ans = extract_assistant(raw_after)
@@ -759,11 +1061,26 @@ def main():
         if len(after_ans) > len(before_ans) + 30:
             success_longer += 1
 
+        before_text_tokens = count_text_tokens(processor.tokenizer, before_ans)
+        after_text_tokens = count_text_tokens(processor.tokenizer, after_ans)
+        token_ratio = safe_div(after_new_tokens, max(1, before_new_tokens), default=0.0)
+        text_token_ratio = safe_div(after_text_tokens, max(1, before_text_tokens), default=0.0)
+
         rec = {
             "video": video_name,
             "before_len": len(before_ans),
             "after_len": len(after_ans),
             "ratio": round(len(after_ans) / max(1, len(before_ans)), 3),
+            "before_new_tokens": int(before_new_tokens),
+            "after_new_tokens": int(after_new_tokens),
+            "token_ratio": round(token_ratio, 6),
+            "before_text_tokens": int(before_text_tokens),
+            "after_text_tokens": int(after_text_tokens),
+            "text_token_ratio": round(text_token_ratio, 6),
+            "gen_before_s": float(tinfo.gen_before_s),
+            "gen_after_s": float(tinfo.gen_after_s),
+            "tokens_per_s_before": safe_div(before_new_tokens, tinfo.gen_before_s, default=0.0),
+            "tokens_per_s_after": safe_div(after_new_tokens, tinfo.gen_after_s, default=0.0),
             "response_before": before_ans,
             "response_after": after_ans,
             "raw_before": raw_before,
@@ -771,6 +1088,12 @@ def main():
         }
         summary[vid] = rec
         timings.append(tinfo)
+        before_new_tokens_list.append(int(before_new_tokens))
+        after_new_tokens_list.append(int(after_new_tokens))
+        token_ratio_list.append(float(token_ratio))
+        before_text_tokens_list.append(int(before_text_tokens))
+        after_text_tokens_list.append(int(after_text_tokens))
+        text_token_ratio_list.append(float(text_token_ratio))
 
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(rec, f, indent=2, ensure_ascii=False)
@@ -781,6 +1104,8 @@ def main():
                 "total_before_s": tinfo.total_before_s,
                 "total_after_s": tinfo.total_after_s,
                 "overhead_s": tinfo.overhead_s,
+                "tokens_per_s_before": safe_div(tinfo.gen_before_new_tokens, tinfo.gen_before_s, default=0.0),
+                "tokens_per_s_after": safe_div(tinfo.gen_after_new_tokens, tinfo.gen_after_s, default=0.0),
             })
             json.dump(d, f, indent=2, ensure_ascii=False)
 
@@ -797,6 +1122,12 @@ def main():
         "corrupt_or_failed_videos": corrupt[:50],
         "success_contains_However": success_contains_however,
         "success_longer_than_before_plus_30chars": success_longer,
+        "stats_before_new_tokens": stats([float(x) for x in before_new_tokens_list]),
+        "stats_after_new_tokens": stats([float(x) for x in after_new_tokens_list]),
+        "stats_token_ratio": stats([float(x) for x in token_ratio_list]),
+        "stats_before_text_tokens": stats([float(x) for x in before_text_tokens_list]),
+        "stats_after_text_tokens": stats([float(x) for x in after_text_tokens_list]),
+        "stats_text_token_ratio": stats([float(x) for x in text_token_ratio_list]),
         "stats_preprocess_s": stats([t.preprocess_s for t in timings]),
         "stats_gen_before_s": stats([t.gen_before_s for t in timings]),
         "stats_apply_attack_s": stats([t.apply_attack_s for t in timings]),
